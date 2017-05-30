@@ -96,7 +96,7 @@ type Dump struct {
 	PtrSize      uint64 // in bytes
 	HeapStart    uint64
 	HeapEnd      uint64
-	TheChar      byte
+	GoArch       string
 	Experiment   string
 	Ncpu         uint64
 	Types        []*Type
@@ -496,8 +496,16 @@ type tkey struct {
 	gcsig string
 }
 
-func (d *Dump) makeFullType(size uint64, gcmap string) *FullType {
-	name := fmt.Sprintf("%d_%s", size, gcmap)
+func (d *Dump) makeFullType(size uint64, gcmap string, offs []uint64) *FullType {
+	var name string
+	if len(offs) == int(size/d.PtrSize) {
+		name = fmt.Sprintf("[%d]ptr", len(offs))
+	} else {
+		name = fmt.Sprintf("%d_%+v", size, offs)
+		if name == "48_[16 24 40]" {
+			name = "hashmap"
+		}
+	}
 	ft := &FullType{len(d.FTList), size, gcmap, name, nil, nil}
 	d.FTList = append(d.FTList, ft)
 	return ft
@@ -516,8 +524,8 @@ func rawRead(filename string) *Dump {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if prefix || (string(hdr) != "go1.4 heap dump" && string(hdr) != "go1.5 heap dump" && string(hdr) != "go1.6 heap dump") {
-		log.Fatal("not a go1.[456] heap dump file")
+	if prefix || string(hdr) != "go1.7 heap dump" {
+		log.Fatal("not a go1.7 heap dump file")
 	}
 
 	var d Dump
@@ -527,10 +535,12 @@ func rawRead(filename string) *Dump {
 	ftmap := map[tkey]*FullType{} // full type dedup
 	memprof := map[uint64]*MemProfEntry{}
 	var sig []byte // buffer for reading a garbage collection signature
+	var offs []uint64
 	for {
 		kind := readUint64(r)
 		switch kind {
 		case tagObject:
+			//log.Println("object")
 			obj := object{}
 			obj.Addr = readUint64(r)
 			size := readUint64(r)
@@ -540,6 +550,7 @@ func rawRead(filename string) *Dump {
 			// build a "signature" for the object.  This is its type
 			// as far as the garbage collector is concerned.
 			sig = sig[:0]
+			offs = offs[:0]
 			var offset uint64
 		gcloop:
 			for {
@@ -547,26 +558,20 @@ func rawRead(filename string) *Dump {
 				// S = scalar
 				// I = iface
 				// E = eface
-				switch FieldKind(readUint64(r)) {
+				switch k := FieldKind(readUint64(r)); k {
 				case FieldKindPtr:
-					for off := readUint64(r); offset < off; offset += d.PtrSize {
+					off := readUint64(r)
+					for offset < off {
 						sig = append(sig, 'S')
+						offset += d.PtrSize
 					}
 					sig = append(sig, 'P')
 					offset += d.PtrSize
-				case FieldKindIface:
-					for off := readUint64(r); offset < off; offset += d.PtrSize {
-						sig = append(sig, 'S')
-					}
-					sig = append(sig, 'I', 'I')
-					offset += 2 * d.PtrSize
-				case FieldKindEface:
-					for off := readUint64(r); offset < off; offset += d.PtrSize {
-						sig = append(sig, 'S')
-					}
-					sig = append(sig, 'E', 'E')
-					offset += 2 * d.PtrSize
+					offs = append(offs, off)
 				case FieldKindEol:
+					break gcloop
+				default:
+					fmt.Println("Unknown field kind", k)
 					break gcloop
 				}
 			}
@@ -574,16 +579,18 @@ func rawRead(filename string) *Dump {
 			k := tkey{size, gcsig}
 			ft := ftmap[k]
 			if ft == nil {
-				ft = d.makeFullType(size, gcsig)
+				ft = d.makeFullType(size, gcsig, offs)
 				ftmap[k] = ft
 			}
 			obj.Ft = ft
 			d.objects = append(d.objects, obj)
 		case tagEOF:
+			log.Println("EOF")
 			return &d
 		case tagOtherRoot:
 			t := &OtherRoot{}
 			t.Description = readString(r)
+			log.Println("OtherRoot", t.Description)
 			t.toaddr = readUint64(r)
 			d.Otherroots = append(d.Otherroots, t)
 		case tagType:
@@ -591,6 +598,7 @@ func rawRead(filename string) *Dump {
 			typ.Addr = readUint64(r)
 			typ.Size = readUint64(r)
 			typ.Name = readString(r)
+			log.Printf("Type %x %d %s\n", typ.Addr, typ.Size, typ.Name)
 			typ.interfaceptr = readBool(r)
 			// Note: there may be duplicate type records in a dump.
 			// The duplicates get thrown away here.
@@ -615,6 +623,7 @@ func rawRead(filename string) *Dump {
 			g.deferaddr = readUint64(r)
 			g.panicaddr = readUint64(r)
 			d.Goroutines = append(d.Goroutines, g)
+			log.Printf("Goroutine %+v\n", g)
 		case tagStackFrame:
 			t := &StackFrame{}
 			t.Addr = readUint64(r)
@@ -626,6 +635,7 @@ func rawRead(filename string) *Dump {
 			readUint64(r) // continpc
 			t.Name = readString(r)
 			t.Fields = readFields(r)
+			log.Printf("StackFrame %x\n", t.Addr)
 			if t.Name == "runtime.goexit" {
 				// This is the function that "lives" at the top of stack.
 				// It isn't really there, however.  It is just the
@@ -651,6 +661,7 @@ func rawRead(filename string) *Dump {
 			}
 			d.Frames = append(d.Frames, t)
 		case tagParams:
+			log.Println("Params")
 			if readUint64(r) == 0 {
 				d.Order = binary.LittleEndian
 			} else {
@@ -659,10 +670,11 @@ func rawRead(filename string) *Dump {
 			d.PtrSize = readUint64(r)
 			d.HeapStart = readUint64(r)
 			d.HeapEnd = readUint64(r)
-			d.TheChar = byte(readUint64(r))
+			d.GoArch = readString(r)
 			d.Experiment = readString(r)
 			d.Ncpu = readUint64(r)
 		case tagFinalizer:
+			log.Println("Finalizer")
 			t := &Finalizer{}
 			t.obj = readUint64(r)
 			t.fn = readUint64(r)
@@ -671,6 +683,7 @@ func rawRead(filename string) *Dump {
 			t.ot = readUint64(r)
 			d.Finalizers = append(d.Finalizers, t)
 		case tagQFinal:
+			log.Println("QFinal")
 			t := &QFinalizer{}
 			t.obj = readUint64(r)
 			t.fn = readUint64(r)
@@ -684,23 +697,28 @@ func rawRead(filename string) *Dump {
 			t.Data = readBytes(r)
 			t.Fields = readFields(r)
 			d.Data = t
+			log.Printf("Data %x\n", t.Addr)
 		case tagBss:
 			t := &Data{}
 			t.Addr = readUint64(r)
 			t.Data = readBytes(r)
 			t.Fields = readFields(r)
 			d.Bss = t
+			log.Printf("Bss %x\n", t.Addr)
 		case tagItab:
 			addr := readUint64(r)
 			typaddr := readUint64(r)
+			log.Printf("Itab %x %x\n", addr, typaddr)
 			d.ItabMap[addr] = typaddr
 		case tagOSThread:
+			log.Println("OSThread")
 			t := &OSThread{}
 			t.addr = readUint64(r)
 			t.id = readUint64(r)
 			t.procid = readUint64(r)
 			d.Osthreads = append(d.Osthreads, t)
 		case tagMemStats:
+			log.Println("MemStats")
 			t := &runtime.MemStats{}
 			t.Alloc = readUint64(r)
 			t.TotalAlloc = readUint64(r)
@@ -732,6 +750,7 @@ func rawRead(filename string) *Dump {
 			t.NumGC = uint32(readUint64(r))
 			d.Memstats = t
 		case tagDefer:
+			log.Println("Defer")
 			t := &Defer{}
 			t.addr = readUint64(r)
 			t.gp = readUint64(r)
@@ -742,6 +761,7 @@ func rawRead(filename string) *Dump {
 			t.link = readUint64(r)
 			d.Defers = append(d.Defers, t)
 		case tagPanic:
+			log.Println("Panic")
 			t := &Panic{}
 			t.addr = readUint64(r)
 			t.gp = readUint64(r)
@@ -751,6 +771,7 @@ func rawRead(filename string) *Dump {
 			t.link = readUint64(r)
 			d.Panics = append(d.Panics, t)
 		case tagMemProf:
+			log.Println("MemProf")
 			t := &MemProfEntry{}
 			key := readUint64(r)
 			t.size = readUint64(r)
@@ -767,6 +788,7 @@ func rawRead(filename string) *Dump {
 			d.MemProf = append(d.MemProf, t)
 			memprof[key] = t
 		case tagAllocSample:
+			log.Println("AllocSample")
 			t := &AllocSample{}
 			t.Addr = readUint64(r)
 			t.Prof = memprof[readUint64(r)]
